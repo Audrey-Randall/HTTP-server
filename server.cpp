@@ -80,7 +80,7 @@ void catch_sigint(int s){
         q.pop();
         delete(ele);
     }
-    cout<<"afsfsafsaff"<<endl;
+    //cout<<"afsfsafsaff"<<endl;
     //exit(0);
 }
 
@@ -130,7 +130,10 @@ void set_home_dir(){
             cout<<"Port is: "<<port<<endl;
         }
         if(word0 == "DirectoryIndex") {
-
+            for(int i = 1; i < numTokens; i++) {
+                string idx(token[i]);
+                indexes.push_back(idx);
+            }
         }
     }
 }
@@ -216,7 +219,28 @@ int sendFile(int client_fd, string filepath) {
     string header_str;
     Header* header = new Header;
     string ext;
-    string fullPath = homeDir + filepath;
+    string fullPath;
+    bool foundIdx = false;
+    //PROBABLY ALL THE BROKEN
+    if(filepath == "/") {
+        int i = 0;
+        do {
+            fullPath = homeDir + indexes[i];
+            response = fopen(fullPath, "rb");
+            if(response != NULL) foundIdx = true;
+            fclose(response);
+            i++;
+        } while (!foundIdx && i < indexes.size());
+        if(foundIdx) {
+            foundIdx = true;
+            filepath = indexes[i];
+        } else {
+            cout<<"No valid index file found"<<endl;
+            is404 = 1;
+        }
+    }
+
+    fullPath = homeDir + filepath;
 
     stringstream strstream;
     strstream.str(filepath);
@@ -224,7 +248,7 @@ int sendFile(int client_fd, string filepath) {
     ext = "."+ext;
     pack_header(header, ext);
 
-    response = fopen(fullPath.c_str(), "rb");
+    if(!is404) response = fopen(fullPath.c_str(), "rb");
     if(response == NULL) {
         perror("Open file error in sendFile");
         printf("Full path: %s\n", fullPath.c_str());
@@ -270,6 +294,7 @@ int sendFile(int client_fd, string filepath) {
         bzero(buffer, sizeof(buffer));
     }
     if (n < 0) printf("Read error\n");
+    fclose(response);
     return 0;
 }
 
