@@ -22,6 +22,7 @@
 #include <fstream>
 #include <string>
 #include <sstream>
+#include <vector>
 using namespace std;
 
 typedef struct Ele{
@@ -36,10 +37,12 @@ pthread_t senderThreads[10];
 string homeDir;
 bool caughtSigInt;
 int sock_fd;
+int port;
 
 pthread_mutex_t q_lock;
 queue<Ele*> q;
 int threadsActive;
+vector<string> indexes;
 
 /* Notes: TCP sockets differ from UDP in that they need a call to listen() and they use recv(), not recvfrom().
     Why are sockaddr_in structs created like that then cast to sockaddr structs?
@@ -71,6 +74,13 @@ void catch_sigint(int s){
     }
     pthread_mutex_destroy(&q_lock);
     close(sock_fd);
+    while(!q.empty()){
+        cout<<"Stuff left in queue?"<<endl;
+        Ele* ele = q.front();
+        q.pop();
+        delete(ele);
+    }
+    cout<<"afsfsafsaff"<<endl;
     //exit(0);
 }
 
@@ -93,10 +103,14 @@ void set_home_dir(){
         // parse the line
         //strtok returns 0 (NULL?) if it can't find a token
         token[0] = strtok(buf, DELIMITER);
+        int numTokens;
         if (token[0]) {
             for (n = 1; n < MAX_TOKENS_PER_LINE; n++) {
                 token[n] = strtok(0, DELIMITER);
-                if (!token[n]) break; // no more tokens
+                if (!token[n]) {
+                    numTokens = n-1;
+                    break; // no more tokens
+                }
             }
         }
         string word0(token[0]);
@@ -108,6 +122,15 @@ void set_home_dir(){
             }
             string realRealDir(realDir);
             homeDir = realRealDir;
+        }
+        if(word0 == "Listen") {
+            stringstream strVal;
+            strVal<<token[1];
+            strVal>>port;
+            cout<<"Port is: "<<port<<endl;
+        }
+        if(word0 == "DirectoryIndex") {
+
         }
     }
 }
@@ -273,9 +296,16 @@ void *crawlQueue(void *payload){
     }
 }
 
+void catch_sigseg(int s){
+    //HORRIBLE HACKY CHEAT NEVER EVER DO THIS THE POINT OF SEG FAULT HANDLERS IS TO DEBUG THEM NOT HIDE THEM ALSO IF YOU GET SEG FAULTS ANYWHERE ELSE YOU'RE SCREWED
+    //printf("Segmentation fault in thread %X\n", pthread_self());
+    exit(1);
+}
+
 int main(int argc, char* argv[]) {
     struct sockaddr_in server, client;
     struct sigaction sigIntHandler;
+    struct sigaction sigSegHandler;
     int client_fd, read_size;
     socklen_t sockaddr_len;
     char* client_req = new char[1024];
@@ -293,7 +323,12 @@ int main(int argc, char* argv[]) {
     sigemptyset(&sigIntHandler.sa_mask);
     sigIntHandler.sa_flags = 0;
 
+    sigSegHandler.sa_handler = catch_sigseg;
+    sigemptyset(&sigSegHandler.sa_mask);
+    sigSegHandler.sa_flags = 0;
+
     sigaction(SIGINT, &sigIntHandler, NULL);
+    sigaction(SIGSEGV, &sigSegHandler, NULL);
 
     //Initialize mutexes and queue
     if(pthread_mutex_init(&q_lock, NULL) != 0) {
@@ -301,6 +336,7 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
+    set_home_dir();
     if((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("Socket creation error");
         return 1;
@@ -313,7 +349,7 @@ int main(int argc, char* argv[]) {
     }
 
     server.sin_family = AF_INET;
-    server.sin_port= htons(8080);
+    server.sin_port= htons(port);
     server.sin_addr.s_addr = htonl(INADDR_ANY);
     sockaddr_len = sizeof(server);
 
@@ -326,7 +362,6 @@ int main(int argc, char* argv[]) {
         perror("Listen error");
         return 1;
     }
-    set_home_dir();
 
     //Initialize thread pool
     for(int i = 0; i < 10; i++) {
@@ -339,12 +374,15 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    while(1) {
+    while(!caughtSigInt && threadsActive > 0) {
+        cout<<"threads active = "<<threadsActive<<endl;
         if((client_fd = accept(sock_fd, (struct sockaddr *)&client, &sockaddr_len)) < 0) {
             perror("Accept error");
+            while(threadsActive > 0);
+            cout<<"threadsActive after accept error: "<<threadsActive<<endl;
             return 1;
         }
-        if(caughtSigInt) return 0;
+        //if(caughtSigInt) return 0;
         while((read_size = recv(client_fd , client_req , 2000 , 0)) > 0 ) {
             //parse request. TODO: handle security issues here
             if(parse_request(client_req, method, uri, version) < 0) {
@@ -368,6 +406,8 @@ int main(int argc, char* argv[]) {
 
         if(read_size < 0) {
             perror("Recv failed");
+            while(threadsActive > 0);
+            cout<<"threadsActive after accept error: "<<threadsActive<<endl;
             return 1;
         }
     }
