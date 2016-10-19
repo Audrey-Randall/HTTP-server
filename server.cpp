@@ -14,7 +14,8 @@
 #include <memory.h>
 #include <errno.h>
 #include <math.h>
-#include "queue.h"
+#include <queue>
+#include <pthread.h>
 
 //C++
 #include <iostream>
@@ -23,12 +24,22 @@
 #include <sstream>
 using namespace std;
 
+typedef struct Ele{
+    int client_fd;
+    string uri;
+}Ele;
+
 const int MAX_CHARS_PER_LINE = 512;
 const int MAX_TOKENS_PER_LINE = 20;
 const char* const DELIMITER = " ";
+pthread_t senderThreads[10];
 string homeDir;
 bool caughtSigInt;
 int sock_fd;
+
+pthread_mutex_t q_lock;
+queue<Ele*> q;
+int threadsActive;
 
 /* Notes: TCP sockets differ from UDP in that they need a call to listen() and they use recv(), not recvfrom().
     Why are sockaddr_in structs created like that then cast to sockaddr structs?
@@ -52,16 +63,15 @@ typedef struct Entry{
 }Entry;
 
 void catch_sigint(int s){
-    cout<<"caught signal "<<s<<endl;
+    cout<<"caught signal "<<s<<", exiting"<<endl;
     caughtSigInt = true;
+    for(int i=0; i<10; i++)  {
+        pthread_join(senderThreads[i], NULL);
+        threadsActive--;
+    }
+    pthread_mutex_destroy(&q_lock);
     close(sock_fd);
-    exit(0);
-}
-
-void shut_down(int sock_fd){
-    cout<<"Received SIGINT, shutting down"<<endl;
-    close(sock_fd);
-    exit(0);
+    //exit(0);
 }
 
 void set_home_dir(){
@@ -89,10 +99,8 @@ void set_home_dir(){
                 if (!token[n]) break; // no more tokens
             }
         }
-        cout<<"In set_home_dir, token[0] is "<<token[0]<<endl;
         string word0(token[0]);
         if(word0 == "DocumentRoot"){
-            cout<<"In set_home_dir, found DocumentRoot"<<endl;
             int n;
             char* realDir = new char[strlen(token[1])-2];
             for(n = 1; n < strlen(token[1])-1; n++) {
@@ -100,7 +108,6 @@ void set_home_dir(){
             }
             string realRealDir(realDir);
             homeDir = realRealDir;
-            cout<<"realRealDir is "<<realRealDir<<endl;
         }
     }
 }
@@ -131,7 +138,6 @@ int getType(string ext, Entry* type) {
                 if (!token[n]) break; // no more tokens
             }
         }
-        cout<<"token0: "<<token[0]<<" token1: "<<token[1]<<" ext: "<<ext<<endl;
         if(token[0] && token[1]) {
             string tok0(token[0]);
             string tok1(token[1]);
@@ -139,7 +145,6 @@ int getType(string ext, Entry* type) {
                 //string tok1(token[1]);
                 (type->data).assign(tok1);
                 type->len = strlen(token[1]);
-                cout<<"type->data: "<<type->data<<endl;
                 return 0;
             }
         }
@@ -178,7 +183,7 @@ int parse_request(char* client_req, char* method, char* uri, char* version) {
     return 0;
 }
 
-int sendFile(int client_fd, char* filepath) {
+int sendFile(int client_fd, string filepath) {
     FILE* response;
     struct sockaddr_in remoteSock;
     int fileSize = 0;
@@ -188,8 +193,7 @@ int sendFile(int client_fd, char* filepath) {
     string header_str;
     Header* header = new Header;
     string ext;
-    string strUri(filepath);
-    string fullPath = homeDir + strUri;
+    string fullPath = homeDir + filepath;
 
     stringstream strstream;
     strstream.str(filepath);
@@ -246,6 +250,29 @@ int sendFile(int client_fd, char* filepath) {
     return 0;
 }
 
+void *crawlQueue(void *payload){
+    //pop Ele from queue if queue isn't empty
+    while(!caughtSigInt) {
+        pthread_mutex_lock(&q_lock);
+        int success = 0;
+        Ele* ele = new Ele;
+        if(!q.empty()) {
+            success = 1;
+            ele = q.front();
+            q.pop();
+        }
+        pthread_mutex_unlock(&q_lock);
+        if(success) {
+            sendFile(ele->client_fd, ele->uri);
+        } else{
+            //if queue was empty wait and check again
+            int sleep_time = rand()%101;
+            usleep(sleep_time);
+        }
+        delete(ele);
+    }
+}
+
 int main(int argc, char* argv[]) {
     struct sockaddr_in server, client;
     struct sigaction sigIntHandler;
@@ -260,12 +287,19 @@ int main(int argc, char* argv[]) {
     bzero(uri, 1086);
     bzero(version, 8);
     caughtSigInt = false;
+    threadsActive = 0;
 
     sigIntHandler.sa_handler = catch_sigint;
     sigemptyset(&sigIntHandler.sa_mask);
     sigIntHandler.sa_flags = 0;
 
     sigaction(SIGINT, &sigIntHandler, NULL);
+
+    //Initialize mutexes and queue
+    if(pthread_mutex_init(&q_lock, NULL) != 0) {
+        fprintf(stderr, "ERROR: Mutex initialization failed. \n");
+        exit(1);
+    }
 
     if((sock_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("Socket creation error");
@@ -288,29 +322,45 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    if(listen(sock_fd, 3) < 0) {
-        //backlog is 3 because the example is 3
+    if(listen(sock_fd, 10) < 0) {
         perror("Listen error");
         return 1;
     }
     set_home_dir();
+
+    //Initialize thread pool
+    for(int i = 0; i < 10; i++) {
+        int retVal = pthread_create(&senderThreads[i], NULL, crawlQueue, NULL);
+        if(retVal) {
+            perror("Error in pthread_create");
+            exit(1);
+        } else {
+            threadsActive++;
+        }
+    }
+
     while(1) {
-        if(caughtSigInt) break;
         if((client_fd = accept(sock_fd, (struct sockaddr *)&client, &sockaddr_len)) < 0) {
             perror("Accept error");
             return 1;
         }
+        if(caughtSigInt) return 0;
         while((read_size = recv(client_fd , client_req , 2000 , 0)) > 0 ) {
-            //Echo message back. Write replaces LF with CRLF if not already there
-            //send(client_fd, client_req, strlen(client_req), 0);
             //parse request. TODO: handle security issues here
             if(parse_request(client_req, method, uri, version) < 0) {
                 printf("Parse error\n");
                 //send error consistent with return value
             } else {
-                //TODO: create thread to run sendFile here
+                //push client_fd and uri to queue?
+                //so that threads can read from queue and send the file?
+                Ele* ele = new Ele;
+                ele->client_fd = client_fd;
+                ele->uri = uri;
+                pthread_mutex_lock(&q_lock);
+                q.push(ele);
+                pthread_mutex_unlock(&q_lock);
 
-                sendFile(client_fd, uri);
+                //sendFile(client_fd, uri);
             }
             bzero(client_req, 2000);
             fflush(stdout);
@@ -321,6 +371,5 @@ int main(int argc, char* argv[]) {
             return 1;
         }
     }
-    shut_down(sock_fd);
     return 0;
 }
