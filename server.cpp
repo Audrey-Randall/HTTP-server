@@ -27,7 +27,6 @@ using namespace std;
 
 typedef struct Ele{
     int client_fd;
-    string uri;
     string client_msg;
 }Ele;
 
@@ -182,7 +181,7 @@ int getType(string ext, Entry* type) {
     return -1;
 }
 
-void pack_header(Header* header, string ext) {
+void pack_header(Header* header, string ext, int* errCode) {
     cout<<"Entering pack_header"<<endl;
     string c_type = "Content-Type";
     string c_len = "Content-Length";
@@ -198,7 +197,7 @@ void pack_header(Header* header, string ext) {
     header->val2 = "2"; //gets overwritten
     header->val3 = "Close";
     header->resp_code = "200";
-    switch(errCode) {
+    switch(*errCode) {
         case 200:
             header->resp_human = "OK";
             break;
@@ -222,50 +221,51 @@ void pack_header(Header* header, string ext) {
     header->version = "HTTP/1.0";
 }
 
-int parse_request(char* client_req, char* method, char* uri, char* version) {
-    sscanf(client_req, "%s %s %s", method, uri, version);
-    string strMeth(method);
-    string strUri(uri);
-    string strVer(version);
+int parse_request(const char* client_req, string* uri, int* errCode, bool* invalidMethod, bool*invalidVersion) {
+    char* charURI = new char[200];
+    char* charMeth = new char[200];
+    char* charVer = new char[200];
+    sscanf(client_req, "%s %s %s", charMeth, charURI, charVer);
+    string strMeth(charMeth);
+    string strUri(charURI);
+    string strVer(charVer);
     if(strMeth != "GET" && (strMeth == "POST" || strMeth == "DELETE" || strMeth == "HEAD" || strMeth == "PUT" || strMeth == "OPTIONS")) {
         printf("Unimplemented HTTP method\n");
-        errCode = 501;
+        *errCode = 501;
         return -1;
     } else if(strMeth != "GET") {
         printf("Completely invalid HTTP method\n");
-        invalidMethod = true;
-        errCode = 400;
+        *invalidMethod = true;
+        *errCode = 400;
         return -1;
     } else if(strUri.find(' ') != string::npos || strUri[0] != '/'){
         cout<<"Invalid URI"<<endl;
-        invalidURI = true;
-        errCode = 400;
+        *errCode = 404;
         return -1;
     } else if(strVer.find("HTTP/") == string::npos) {
         printf("Invalid HTTP version\n");
-        invalidVersion = true;
-        errCode = 400;
+        *invalidVersion = true;
+        *errCode = 400;
         return -1;
     } else if(strVer != "HTTP/1.0" && strVer != "HTTP/1.1") {
         cout<<"Incorrect version (not implemented)"<<endl;
-        errCode = 501;
+        *errCode = 501;
         return -1;
-    } else {
-        printf("In parse_request, command was \"%s,%s,%s\"\n", method, uri, version);
     }
+    *uri = strUri;
     return 0;
 }
 
-int throwError(int client_fd, Header* header){
+int throwError(int client_fd, Header* header, int* errCode, bool* invalidMethod, bool* invalidVersion){
     cout<<"Inside throw error, errCode is "<<errCode<<endl;
     string msg;
     //set msg length
-    switch(errCode){
+    switch(*errCode){
     case 200:
         return 0;
     case 400:
-        if(invalidMethod) msg = "<html><body>400 Bad Request Reason: Invalid Method :<<request method>></body></html>";
-        else if(invalidVersion) msg = "<html><body>400 Bad Request Reason: Invalid HTTPVersion: <<req version>></body></html>";
+        if(*invalidMethod) msg = "<html><body>400 Bad Request Reason: Invalid Method :<<request method>></body></html>";
+        else if(*invalidVersion) msg = "<html><body>400 Bad Request Reason: Invalid HTTPVersion: <<req version>></body></html>";
         break;
     case 404:
         msg = "<html><body>404 Not Found Reason URL does not exist :<<requested url>></body></html>";
@@ -284,7 +284,7 @@ int throwError(int client_fd, Header* header){
     return 1;
 }
 
-int sendFile(int client_fd, string filepath) {
+int sendFile(int client_fd, string client_msg) {
     FILE* response;
     struct sockaddr_in remoteSock;
     int fileSize = 0;
@@ -298,12 +298,17 @@ int sendFile(int client_fd, string filepath) {
     bool foundIdx = false;
 
     //Error flags
-    int errCode;
-    bool invalidMethod;
+    int* errCode = new int;
+    *errCode = 200;
+    bool* invalidMethod = new bool;
+    *invalidMethod = false;
     bool invalidURI;
-    bool invalidVersion;
+    bool* invalidVersion = new bool;
+    *invalidVersion = false;
 
-    parse_request()
+    string* uri = new string;
+    parse_request(client_msg.c_str(), uri, errCode, invalidMethod, invalidVersion);
+    string filepath = *uri;
 
     //PROBABLY ALL THE BROKEN
     if(filepath == "/") {
@@ -330,22 +335,27 @@ int sendFile(int client_fd, string filepath) {
 
     fullPath = homeDir + filepath;
 
-    stringstream strstream;
+    /*stringstream strstream;
     strstream.str(filepath);
     while(getline(strstream, ext, '.'));
-    ext = "."+ext;
-    pack_header(header, ext);
+    ext = "."+ext;*/
+    cout<<filepath<<endl;
+    int idx = filepath.find('.');
+    ext = filepath.substr(idx, filepath.length()-1);
+    ext = "/"+ext;
+    cout<<"ext is "<<endl;
+    pack_header(header, ext, errCode);
 
     if(!is404) response = fopen(fullPath.c_str(), "rb");
     if(response == NULL) {
         perror("Open file error in sendFile");
         printf("Full path: %s\n", fullPath.c_str());
         cout<<"homeDir is "<<homeDir<<endl;
-        errCode = 404;
+        *errCode = 404;
         header->resp_code = "404";
         header->resp_human = "File not found";
     }
-    if(throwError(client_fd, header)) return 0;
+    if(throwError(client_fd, header, errCode, invalidMethod, invalidVersion)) return 0;
 
     if(is404) {
         response = fopen("404.html", "rb");
@@ -400,7 +410,7 @@ void *crawlQueue(void *payload){
         }
         pthread_mutex_unlock(&q_lock);
         if(success) {
-            sendFile(ele->client_fd, ele->uri, ele->client_msg);
+            sendFile(ele->client_fd, ele->client_msg);
         } else{
             //if queue was empty wait and check again
             int sleep_time = rand()%101;
@@ -432,10 +442,6 @@ int main(int argc, char* argv[]) {
     bzero(version, 8);
     caughtSigInt = false;
     threadsActive = 0;
-    errCode = 200;
-    invalidMethod = false;
-    invalidURI = false;
-    invalidVersion = false;
 
     sigIntHandler.sa_handler = catch_sigint;
     sigemptyset(&sigIntHandler.sa_mask);
@@ -505,7 +511,6 @@ int main(int argc, char* argv[]) {
             Ele* ele = new Ele;
             string msg(client_req);
             ele->client_fd = client_fd;
-            ele->uri = uri;
             ele->client_msg = msg;
             pthread_mutex_lock(&q_lock);
             q.push(ele);
