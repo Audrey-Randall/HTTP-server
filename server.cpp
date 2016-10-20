@@ -28,6 +28,7 @@ using namespace std;
 typedef struct Ele{
     int client_fd;
     string uri;
+    string client_msg;
 }Ele;
 
 const int MAX_CHARS_PER_LINE = 512;
@@ -134,6 +135,9 @@ void set_home_dir(){
                 string idx(token[i]);
                 indexes.push_back(idx);
             }
+            for(int i = 0; i < indexes.size(); i++) {
+                cout<<"Indexes["<<i<<"] is "<<indexes[i]<<endl;
+            }
         }
     }
 }
@@ -191,22 +195,93 @@ void pack_header(Header* header, string ext) {
     getType(ext, type);
     if(type->data == "error") cout<<"Error: content type not found"<<endl;
     header->val1 = type->data;
-    header->val2 = "2";
+    header->val2 = "2"; //gets overwritten
     header->val3 = "Close";
     header->resp_code = "200";
+    switch(errCode) {
+        case 200:
+            header->resp_human = "OK";
+            break;
+        case 400:
+            header->resp_human = "Bad Request";
+            break;
+        case 404:
+            header->resp_human = "Not Found";
+            break;
+        case 500:
+            header->resp_human = "Internal Server Error: cannot allocate memory";
+            break;
+        case 501:
+            header->resp_human = "Not Implemented";
+            break;
+        default:
+            cout<<"Error assigning human-readable error code in pack_header"<<endl;
+            header->resp_human = "undefined error";
+    }
     header->resp_human = "OK";
     header->version = "HTTP/1.0";
 }
 
 int parse_request(char* client_req, char* method, char* uri, char* version) {
     sscanf(client_req, "%s %s %s", method, uri, version);
-    if(strcmp(method, "GET")) {
+    string strMeth(method);
+    string strUri(uri);
+    string strVer(version);
+    if(strMeth != "GET" && (strMeth == "POST" || strMeth == "DELETE" || strMeth == "HEAD" || strMeth == "PUT" || strMeth == "OPTIONS")) {
         printf("Unimplemented HTTP method\n");
-        return -501;
+        errCode = 501;
+        return -1;
+    } else if(strMeth != "GET") {
+        printf("Completely invalid HTTP method\n");
+        invalidMethod = true;
+        errCode = 400;
+        return -1;
+    } else if(strUri.find(' ') != string::npos || strUri[0] != '/'){
+        cout<<"Invalid URI"<<endl;
+        invalidURI = true;
+        errCode = 400;
+        return -1;
+    } else if(strVer.find("HTTP/") == string::npos) {
+        printf("Invalid HTTP version\n");
+        invalidVersion = true;
+        errCode = 400;
+        return -1;
+    } else if(strVer != "HTTP/1.0" && strVer != "HTTP/1.1") {
+        cout<<"Incorrect version (not implemented)"<<endl;
+        errCode = 501;
+        return -1;
     } else {
         printf("In parse_request, command was \"%s,%s,%s\"\n", method, uri, version);
     }
     return 0;
+}
+
+int throwError(int client_fd, Header* header){
+    cout<<"Inside throw error, errCode is "<<errCode<<endl;
+    string msg;
+    //set msg length
+    switch(errCode){
+    case 200:
+        return 0;
+    case 400:
+        if(invalidMethod) msg = "<html><body>400 Bad Request Reason: Invalid Method :<<request method>></body></html>";
+        else if(invalidVersion) msg = "<html><body>400 Bad Request Reason: Invalid HTTPVersion: <<req version>></body></html>";
+        break;
+    case 404:
+        msg = "<html><body>404 Not Found Reason URL does not exist :<<requested url>></body></html>";
+        break;
+    case 500:
+        msg = "";
+        break;
+    case 501:
+        msg = "<html><body>501 Not Implemented <<error type>>: <<requested data>></body></html>";
+        break;
+    }
+    string header_str = header->version + " " + header->resp_code + " " + header->resp_human + "\r\n" + header->header1 + ": "+header->val1+"\r\n"+header->header2+": "+header->val2+"\r\n"+ header->header3+": "+header->val3+"\r\n\r\n";
+    string payload = header_str + msg;
+    const char* charLoad = payload.c_str();
+    int sent = send(client_fd, charLoad, payload.length(), 0);
+    return 1;
 }
 
 int sendFile(int client_fd, string filepath) {
@@ -221,19 +296,32 @@ int sendFile(int client_fd, string filepath) {
     string ext;
     string fullPath;
     bool foundIdx = false;
+
+    //Error flags
+    int errCode;
+    bool invalidMethod;
+    bool invalidURI;
+    bool invalidVersion;
+
+    parse_request()
+
     //PROBABLY ALL THE BROKEN
     if(filepath == "/") {
         int i = 0;
         do {
-            fullPath = homeDir + indexes[i];
-            response = fopen(fullPath, "rb");
-            if(response != NULL) foundIdx = true;
-            fclose(response);
+            fullPath = homeDir + "/"+indexes[i];
+            cout<<"FULL PATH IS: "<<fullPath<<endl;
+            response = fopen(fullPath.c_str(), "rb");
+            if(response != NULL) {
+                foundIdx = true;
+                fclose(response);
+                break;
+            }
             i++;
         } while (!foundIdx && i < indexes.size());
         if(foundIdx) {
             foundIdx = true;
-            filepath = indexes[i];
+            filepath = "/"+indexes[i];
         } else {
             cout<<"No valid index file found"<<endl;
             is404 = 1;
@@ -253,10 +341,11 @@ int sendFile(int client_fd, string filepath) {
         perror("Open file error in sendFile");
         printf("Full path: %s\n", fullPath.c_str());
         cout<<"homeDir is "<<homeDir<<endl;
-        is404 = 1;
+        errCode = 404;
         header->resp_code = "404";
         header->resp_human = "File not found";
     }
+    if(throwError(client_fd, header)) return 0;
 
     if(is404) {
         response = fopen("404.html", "rb");
@@ -311,7 +400,7 @@ void *crawlQueue(void *payload){
         }
         pthread_mutex_unlock(&q_lock);
         if(success) {
-            sendFile(ele->client_fd, ele->uri);
+            sendFile(ele->client_fd, ele->uri, ele->client_msg);
         } else{
             //if queue was empty wait and check again
             int sleep_time = rand()%101;
@@ -343,6 +432,10 @@ int main(int argc, char* argv[]) {
     bzero(version, 8);
     caughtSigInt = false;
     threadsActive = 0;
+    errCode = 200;
+    invalidMethod = false;
+    invalidURI = false;
+    invalidVersion = false;
 
     sigIntHandler.sa_handler = catch_sigint;
     sigemptyset(&sigIntHandler.sa_mask);
@@ -409,22 +502,14 @@ int main(int argc, char* argv[]) {
         }
         //if(caughtSigInt) return 0;
         while((read_size = recv(client_fd , client_req , 2000 , 0)) > 0 ) {
-            //parse request. TODO: handle security issues here
-            if(parse_request(client_req, method, uri, version) < 0) {
-                printf("Parse error\n");
-                //send error consistent with return value
-            } else {
-                //push client_fd and uri to queue?
-                //so that threads can read from queue and send the file?
-                Ele* ele = new Ele;
-                ele->client_fd = client_fd;
-                ele->uri = uri;
-                pthread_mutex_lock(&q_lock);
-                q.push(ele);
-                pthread_mutex_unlock(&q_lock);
-
-                //sendFile(client_fd, uri);
-            }
+            Ele* ele = new Ele;
+            string msg(client_req);
+            ele->client_fd = client_fd;
+            ele->uri = uri;
+            ele->client_msg = msg;
+            pthread_mutex_lock(&q_lock);
+            q.push(ele);
+            pthread_mutex_unlock(&q_lock);
             bzero(client_req, 2000);
             fflush(stdout);
         }
